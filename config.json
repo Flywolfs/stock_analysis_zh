@@ -1,0 +1,7 @@
+{
+    "data_dir": "data",
+    "start_date": "20250101",
+    "end_date": "20260114",
+    "cache_enabled": true,
+    "max_stocks": 100
+}
