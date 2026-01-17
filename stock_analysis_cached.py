@@ -198,7 +198,7 @@ def get_beijing_stock_daily(symbol: str, start_date: str, end_date: str, retry_c
                 period="daily",
                 start_date=start_date,
                 end_date=end_date,
-                adjust=""
+                adjust="hfq"
             )
             return stock_zh_a_hist_df
         except Exception as e:
@@ -228,7 +228,7 @@ def get_bz50_index_daily(start_date: str, end_date: str, retry_count: int = 3):
                 period="daily",
                 start_date=start_date,
                 end_date=end_date,
-                adjust=""
+                adjust="hfq"
             )
             
             if not bz50_df.empty and '日期' in bz50_df.columns:
@@ -677,10 +677,308 @@ def main():
         print("没有可排序的数据")
 
 
+
+# ==================== 完整交易数据获取和缓存功能 ====================
+
+def fetch_and_cache_full_stock_data(stock_code: str, start_date: str = None, end_date: str = None,
+                                   cache: StockDataCache = None, use_cache: bool = True,
+                                   stock_info_dict: dict = None) -> pd.DataFrame:
+    """
+    获取并缓存股票完整的交易数据（支持增量更新）
+    
+    :param stock_code: 股票代码
+    :param start_date: 开始日期 (YYYYMMDD)，None表示使用股票上市日期
+    :param end_date: 结束日期 (YYYYMMDD)，None表示使用今天日期
+    :param cache: 缓存管理器，None表示使用默认缓存
+    :param use_cache: 是否使用缓存
+    :param stock_info_dict: 股票基本信息字典（证券简称、所属行业等）
+    :return: DataFrame 包含完整交易数据
+    
+    返回的DataFrame包含字段：
+    - date: 日期
+    - open: 开盘价
+    - high: 最高价
+    - low: 最低价
+    - close: 收盘价
+    - volume: 成交量
+    - amount: 成交额
+    - amplitude: 振幅
+    - pct_chg: 涨跌幅(%)
+    - change: 涨跌额
+    - turnover: 换手率
+    """
+    # 初始化缓存管理器
+    if cache is None:
+        cache = StockDataCache("data")
+    
+    # 如果未指定日期，使用默认范围
+    if start_date is None or end_date is None:
+        # 尝试从stock_info_dict获取上市日期
+        list_date = None
+        if stock_info_dict and '上市日期' in stock_info_dict:
+            list_date_raw = stock_info_dict['上市日期']
+            import datetime as dt
+            if isinstance(list_date_raw, str):
+                list_date = list_date_raw.replace('-', '')
+            elif isinstance(list_date_raw, (dt.date, dt.datetime)):
+                list_date = list_date_raw.strftime('%Y%m%d')
+        
+        # 如果没有提供，尝试从metadata获取
+        if not list_date:
+            actual_start, _ = cache.get_stock_actual_date_range(stock_code)
+            if actual_start:
+                list_date = actual_start.replace('-', '')
+        
+        # 设置默认日期范围
+        if start_date is None:
+            start_date = list_date if list_date else '20200101'  # 默认从2020年开始（北交所成立前后）
+        if end_date is None:
+            end_date = datetime.now().strftime('%Y%m%d')  # 今天
+    
+    # 缓存文件路径 (与原有缓存区分开)
+    full_data_dir = os.path.join(cache.data_dir, "full_stocks")
+    os.makedirs(full_data_dir, exist_ok=True)
+    cache_file = os.path.join(full_data_dir, f"{stock_code}_full.json")
+    
+    if use_cache:
+        # 检查缓存
+        if os.path.exists(cache_file):
+            with open(cache_file, 'r', encoding='utf-8') as f:
+                cached_data = json.load(f)
+                cached_df = pd.DataFrame(cached_data['data'])
+                cached_df['date'] = pd.to_datetime(cached_df['date'])
+                
+                # 检查缓存范围
+                if not cached_df.empty:
+                    cached_start = cached_df['date'].min().strftime('%Y%m%d')
+                    cached_end = cached_df['date'].max().strftime('%Y%m%d')
+                    
+                    # 计算缺失范围
+                    missing_ranges = calculate_missing_date_ranges(
+                        cached_start, 
+                        cached_end,
+                        start_date,
+                        end_date
+                    )
+                    
+                    if not missing_ranges:
+                        print(f"  股票 {stock_code} 使用完整数据缓存")
+                        # 过滤出指定日期范围
+                        mask = (cached_df['date'] >= pd.to_datetime(start_date)) & \
+                               (cached_df['date'] <= pd.to_datetime(end_date))
+                        return cached_df[mask].reset_index(drop=True)
+                    else:
+                        print(f"  股票 {stock_code} 需要下载缺失的完整数据: {missing_ranges}")
+                else:
+                    missing_ranges = [(start_date, end_date)]
+        else:
+            missing_ranges = [(start_date, end_date)]
+    else:
+        missing_ranges = [(start_date, end_date)]
+    
+    # 下载新数据
+    all_dfs = []
+    for range_start, range_end in missing_ranges:
+        try:
+            stock_df = get_beijing_stock_daily(str(stock_code), range_start, range_end)
+            if not stock_df.empty:
+                # 标准化列名
+                column_mapping = {
+                    '日期': 'date',
+                    '开盘': 'open',
+                    '收盘': 'close',
+                    '最高': 'high',
+                    '最低': 'low',
+                    '成交量': 'volume',
+                    '成交额': 'amount',
+                    '振幅': 'amplitude',
+                    '涨跌幅': 'pct_chg',
+                    '涨跌额': 'change',
+                    '换手率': 'turnover'
+                }
+                stock_df = stock_df.rename(columns=column_mapping)
+                stock_df['date'] = pd.to_datetime(stock_df['date'])
+                all_dfs.append(stock_df)
+        except Exception as e:
+            print(f"  下载股票 {stock_code} 完整数据失败: {e}")
+    
+    # 合并数据
+    if use_cache and os.path.exists(cache_file):
+        with open(cache_file, 'r', encoding='utf-8') as f:
+            cached_data = json.load(f)
+            cached_df = pd.DataFrame(cached_data['data'])
+            cached_df['date'] = pd.to_datetime(cached_df['date'])
+            all_dfs.insert(0, cached_df)
+    
+    if all_dfs:
+        merged_df = pd.concat(all_dfs, ignore_index=True)
+        merged_df = merged_df.drop_duplicates(subset=['date'], keep='last')
+        merged_df = merged_df.sort_values('date').reset_index(drop=True)
+        
+        # 保存到缓存
+        if use_cache:
+            # 转换为JSON可序列化格式
+            save_df = merged_df.copy()
+            save_df['date'] = save_df['date'].dt.strftime('%Y-%m-%d')
+            cache_data = {
+                'stock_code': stock_code,
+                'last_update': datetime.now().strftime('%Y-%m-%d %H:%M:%S'),
+                'data': save_df.to_dict('records')
+            }
+            
+            # 添加股票基本信息（如果提供）
+            if stock_info_dict:
+                import datetime as dt
+                for key, value in stock_info_dict.items():
+                    # 将pandas的Timestamp转换为字符串
+                    if pd.api.types.is_datetime64_any_dtype(type(value)):
+                        cache_data[key] = pd.to_datetime(value).strftime('%Y-%m-%d')
+                    # 将Python datetime.date/datetime对象转换为字符串
+                    elif isinstance(value, (dt.date, dt.datetime)):
+                        cache_data[key] = value.strftime('%Y-%m-%d') if isinstance(value, dt.datetime) else value.isoformat()
+                    # 将numpy类型转换为Python原生类型
+                    elif hasattr(value, 'item'):
+                        cache_data[key] = value.item()
+                    # 处理NaN和None
+                    elif pd.isna(value):
+                        cache_data[key] = None
+                    else:
+                        cache_data[key] = value
+            
+            with open(cache_file, 'w', encoding='utf-8') as f:
+                json.dump(cache_data, f, ensure_ascii=False, indent=2)
+            
+            # 更新元数据
+            if stock_code not in cache.metadata:
+                cache.metadata[stock_code] = {}
+            cache.metadata[stock_code]['full_data_last_update'] = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
+            if not merged_df.empty:
+                cache.metadata[stock_code]['full_data_start'] = merged_df['date'].min().strftime('%Y-%m-%d')
+                cache.metadata[stock_code]['full_data_end'] = merged_df['date'].max().strftime('%Y-%m-%d')
+            cache._save_metadata()
+        
+        # 过滤出指定日期范围
+        mask = (merged_df['date'] >= pd.to_datetime(start_date)) & \
+               (merged_df['date'] <= pd.to_datetime(end_date))
+        return merged_df[mask].reset_index(drop=True)
+    
+    return pd.DataFrame()
+
+
+def fetch_all_bj_stocks_full_data(start_date: str = None, end_date: str = None, 
+                                 cache: StockDataCache = None,
+                                 use_cache: bool = True,
+                                 max_stocks: int = None) -> Dict[str, pd.DataFrame]:
+    """
+    获取北交所所有股票的完整交易数据
+    
+    :param start_date: 开始日期 (YYYYMMDD)，None表示使用每只股票的上市日期
+    :param end_date: 结束日期 (YYYYMMDD)，None表示使用今天日期
+    :param cache: 缓存管理器
+    :param use_cache: 是否使用缓存
+    :param max_stocks: 最大股票数量，None表示全部
+    :return: {stock_code: DataFrame}
+    """
+    if cache is None:
+        cache = StockDataCache("data")
+    
+    # 获取股票列表
+    stock_info = get_beijing_stocks_data()
+    if stock_info.empty:
+        print("无法获取股票列表")
+        return {}
+    
+    # 创建股票代码到信息的映射字典
+    stock_info_map = {}
+    if '证券代码' in stock_info.columns:
+        stock_codes = stock_info['证券代码'].tolist()
+        # 为每个股票创建信息字典
+        for idx, row in stock_info.iterrows():
+            code = str(row['证券代码'])
+            stock_info_map[code] = {
+                '证券简称': row.get('证券简称', ''),
+                '总股本': row.get('总股本', ''),
+                '流通股本': row.get('流通股本', ''),
+                '上市日期': row.get('上市日期', ''),
+                '所属行业': row.get('所属行业', ''),
+                '地区': row.get('地区', ''),
+                '报告日期': row.get('报告日期', '')
+            }
+    elif '代码' in stock_info.columns:
+        stock_codes = stock_info['代码'].tolist()
+        # 为每个股票创建信息字典（兼容不同的列名）
+        for idx, row in stock_info.iterrows():
+            code = str(row['代码'])
+            stock_info_map[code] = row.to_dict()
+    else:
+        print("无法找到股票代码列")
+        return {}
+    
+    total_stocks = len(stock_codes)
+    if max_stocks:
+        stock_codes = stock_codes[:max_stocks]
+    process_count = len(stock_codes)
+    
+    # 确定日期范围
+    default_end_date = datetime.now().strftime('%Y%m%d') if end_date is None else end_date
+    date_mode = "完整历史" if start_date is None else f"{start_date} ~ {default_end_date}"
+    
+    print(f"\n{'='*60}")
+    print(f"北交所共有 {total_stocks} 只股票")
+    print(f"将获取前 {process_count} 只股票的完整交易数据")
+    print(f"时间范围: {date_mode}")
+    if start_date is None:
+        print(f"  (注：将根据每只股票的上市日期自动确定起始时间)")
+    print(f"{'='*60}\n")
+    
+    all_stocks_data = {}
+    success_count = 0
+    failed_count = 0
+    
+    for i, code in enumerate(stock_codes):
+        print(f"\r[{i+1}/{process_count}] 正在处理股票: {code}", end='', flush=True)
+        
+        try:
+            # 获取该股票的基本信息
+            info_dict = stock_info_map.get(str(code), None)
+            df = fetch_and_cache_full_stock_data(str(code), start_date, end_date, cache, use_cache, info_dict)
+            if not df.empty:
+                all_stocks_data[str(code)] = df
+                success_count += 1
+                print(f"  ✓ 成功 (共 {len(df)} 条记录)")
+            else:
+                failed_count += 1
+                print(f"  × 无数据")
+        except Exception as e:
+            failed_count += 1
+            print(f"  × 失败: {e}")
+        
+        # 每处理10只股票后休息
+        if (i + 1) % 10 == 0 and i + 1 < process_count:
+            pause_time = random.uniform(2, 5)
+            print(f"\n  已处理 {i+1} 只，休息 {pause_time:.1f} 秒...")
+            time.sleep(pause_time)
+    
+    print(f"\n\n{'='*60}")
+    print(f"完成！成功: {success_count} 只，失败: {failed_count} 只")
+    print(f"{'='*60}")
+    
+    return all_stocks_data
+
+
 if __name__ == "__main__":
-    main()
-    # symbol = "920000"
-    # # df = get_beijing_stock_daily(symbol=symbol, start_date='20250101', end_date='20260114')
-    # # print(df)
-    # range = calculate_missing_date_ranges(cached_start='2024-01-02', cached_end='2024-12-31', required_start='20250101', required_end='20260114')
-    # print(range)
+    # main()
+    # 测试获取完整历史数据（不指定日期，自动使用上市日期到今天）
+    fetch_all_bj_stocks_full_data(
+        max_stocks=3,
+        use_cache=True,
+        end_date="20260116",
+    )
+    
+    # 或者指定日期范围获取部分数据
+    # fetch_all_bj_stocks_full_data(
+    #     start_date="20240601",
+    #     end_date="20240831",
+    #     max_stocks=10,
+    #     use_cache=True
+    # )
