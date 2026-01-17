@@ -272,24 +272,19 @@ def fetch_and_cache_stock_data(stock_code: str, start_date: str, end_date: str,
     if use_cache:
         # 检查缓存中的日期范围
         cached_start, cached_end = cache.get_cached_date_range(stock_code)
-        # 检查股票实际存在的日期范围
+        # 检查股票实际存在的日期范围（用于判断股票是否已上市）
         actual_start, actual_end = cache.get_stock_actual_date_range(stock_code)
         
-        # 如果已知道股票的实际日期范围，调整请求范围
-        if actual_start and actual_end:
-            # 请求范围不能超出股票实际存在的范围
+        # 如果已知道股票的实际上市日期，检查请求范围是否在股票上市之前
+        if actual_start:
+            # 只检查开始日期，不检查结束日期（允许查询未来数据）
             actual_start_num = actual_start.replace('-', '')
-            actual_end_num = actual_end.replace('-', '')
             start_date_num = start_date.replace('-', '')
-            end_date_num = end_date.replace('-', '')
             
-            # 调整请求范围到股票实际存在的范围
+            # 如果请求的开始日期在股票上市之前，调整到上市日
             if start_date_num < actual_start_num:
                 start_date = actual_start.replace('-', '')
-                print(f"  股票 {stock_code} 在{start_date_num}之前不存在，调整开始日期为{actual_start}")
-            if end_date_num > actual_end_num:
-                end_date = actual_end.replace('-', '')
-                print(f"  股票 {stock_code} 在{end_date_num}之后不存在，调整结束日期为{actual_end}")
+                print(f"  股票 {stock_code} 在{start_date_num}之前未上市，调整开始日期为{actual_start}")
         
         # 计算需要下载的日期范围
         missing_ranges = calculate_missing_date_ranges(cached_start, cached_end, start_date, end_date)
@@ -516,6 +511,107 @@ def sort_stocks_by_similarity(similarity_results: Dict[str, Dict[str, float]]) -
     return sorted_results
 
 
+def calculate_single_stock_similarity(stock_code: str, start_date: str, end_date: str,
+                                     cache: StockDataCache = None, use_cache: bool = True) -> Dict:
+    """
+    计算单支股票与北证50指数的匹配度
+    
+    :param stock_code: 股票代码 (例: "920000")
+    :param start_date: 开始日期 (格式: YYYYMMDD)
+    :param end_date: 结束日期 (格式: YYYYMMDD)
+    :param cache: 缓存管理器，如果为None将自动创建
+    :param use_cache: 是否使用缓存
+    :return: {
+        "stock_code": 股票代码,
+        "match_days": 匹配天数,
+        "total_days": 总天数,
+        "match_ratio": 匹配率,
+        "details": [
+            {"date": 日期, "stock_level": 股票等级, "market_level": 市场等级, "matched": 是否匹配},
+            ...
+        ]
+    }
+    """
+    # 初始化缓存管理器
+    if cache is None:
+        cache = StockDataCache("data")
+    
+    # 1. 获取北证50指数数据
+    print(f"正在获取北证50指数数据...")
+    market_levels = get_bz50_market_levels_cached(start_date, end_date, cache, use_cache)
+    if not market_levels:
+        return {
+            "error": "无法获取北证50指数数据",
+            "stock_code": stock_code,
+            "match_days": 0,
+            "total_days": 0,
+            "match_ratio": 0.0,
+            "details": []
+        }
+    print(f"✓ 获取到 {len(market_levels)} 天的北证50数据")
+    
+    # 2. 获取个股数据
+    print(f"\n正在获取股票 {stock_code} 的数据...")
+    stock_data = fetch_and_cache_stock_data(stock_code, start_date, end_date, cache, use_cache)
+    if not stock_data:
+        return {
+            "error": f"无法获取股票 {stock_code} 数据",
+            "stock_code": stock_code,
+            "match_days": 0,
+            "total_days": 0,
+            "match_ratio": 0.0,
+            "details": []
+        }
+    print(f"✓ 获取到 {len(stock_data)} 天的股票数据")
+    
+    # 3. 计算每日的等级和匹配度
+    print(f"\n正在计算匹配度...")
+    match_days = 0
+    total_days = 0
+    details = []
+    
+    # 获取所有共同日期并排序
+    common_dates = sorted(set(stock_data.keys()) & set(market_levels.keys()))
+    
+    for date in common_dates:
+        stock_change_pct = stock_data[date]
+        stock_level = calculate_price_change_level(stock_change_pct)
+        market_level = market_levels[date]
+        
+        is_matched = (stock_level == market_level)
+        total_days += 1
+        if is_matched:
+            match_days += 1
+        
+        details.append({
+            "date": date,
+            "stock_change_pct": round(stock_change_pct, 2),
+            "stock_level": stock_level,
+            "market_level": market_level,
+            "matched": is_matched
+        })
+    
+    # 4. 计算匹配率
+    match_ratio = match_days / total_days if total_days > 0 else 0.0
+    
+    result = {
+        "stock_code": stock_code,
+        "match_days": match_days,
+        "total_days": total_days,
+        "match_ratio": match_ratio,
+        "details": details
+    }
+    
+    # 5. 输出结果总结
+    print(f"\n=== 匹配度分析结果 ===")
+    print(f"股票代码: {stock_code}")
+    print(f"分析时间范围: {start_date} ~ {end_date}")
+    print(f"匹配天数: {match_days} / {total_days}")
+    print(f"匹配率: {match_ratio:.2%}")
+    
+    return result
+
+
 def main():
     """主函数"""
     print("=== 北交所股票分析系统（带缓存版本）===\n")
@@ -583,3 +679,8 @@ def main():
 
 if __name__ == "__main__":
     main()
+    # symbol = "920000"
+    # # df = get_beijing_stock_daily(symbol=symbol, start_date='20250101', end_date='20260114')
+    # # print(df)
+    # range = calculate_missing_date_ranges(cached_start='2024-01-02', cached_end='2024-12-31', required_start='20250101', required_end='20260114')
+    # print(range)
