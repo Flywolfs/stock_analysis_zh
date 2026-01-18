@@ -14,7 +14,34 @@ from datetime import datetime, timedelta
 import random
 import numpy as np
 from scipy import stats
+import matplotlib.pyplot as plt
+import matplotlib
+import platform
 warnings.filterwarnings('ignore')
+
+# 设置matplotlib支持中文显示
+def setup_chinese_font():
+    """配置matplotlib中文字体"""
+    system = platform.system()
+    
+    if system == 'Windows':
+        # Windows系统使用微软雅黑或黑体
+        matplotlib.rcParams['font.sans-serif'] = ['Microsoft YaHei', 'SimHei', 'Arial Unicode MS']
+    elif system == 'Darwin':  # macOS
+        # macOS使用苹方或黑体
+        matplotlib.rcParams['font.sans-serif'] = ['PingFang SC', 'Heiti SC', 'STHeiti', 'Arial Unicode MS']
+    else:  # Linux
+        # Linux尝试使用Noto、文泉驿或Droid字体
+        matplotlib.rcParams['font.sans-serif'] = [
+            'Noto Sans CJK SC', 'Noto Sans CJK JP', 'Noto Sans CJK KR',
+            'WenQuanYi Micro Hei', 'WenQuanYi Zen Hei',
+            'Droid Sans Fallback', 'DejaVu Sans'
+        ]
+    
+    matplotlib.rcParams['axes.unicode_minus'] = False  # 用于正常显示负号
+
+# 初始化中文字体配置
+setup_chinese_font()
 
 
 class StockDataCache:
@@ -672,6 +699,171 @@ def calculate_volume_factor(stock_df: pd.DataFrame) -> dict:
     }
 
 
+def calculate_total_return(stock_code: str, start_date: str, end_date: str,
+                          cache: StockDataCache = None, use_cache: bool = True) -> dict:
+    """
+    计算指定股票在指定日期范围内的总涨跌幅度
+    
+    :param stock_code: 股票代码
+    :param start_date: 开始日期 (YYYYMMDD)
+    :param end_date: 结束日期 (YYYYMMDD)
+    :param cache: 缓存管理器
+    :param use_cache: 是否使用缓存
+    :return: {
+        'stock_code': 股票代码,
+        'start_date': 开始日期,
+        'end_date': 结束日期,
+        'start_price': 期初价格,
+        'end_price': 期末价格,
+        'total_return': 总涨跌幅(%),
+        'trading_days': 交易天数,
+        'error': 错误信息（如果有）
+    }
+    """
+    if cache is None:
+        cache = StockDataCache("data")
+    
+    try:
+        # 获取股票完整数据
+        stock_df = fetch_and_cache_full_stock_data(
+            stock_code, start_date, end_date, cache, use_cache
+        )
+        
+        if stock_df.empty:
+            return {
+                'stock_code': stock_code,
+                'start_date': start_date,
+                'end_date': end_date,
+                'start_price': None,
+                'end_price': None,
+                'total_return': None,
+                'trading_days': 0,
+                'error': '无数据'
+            }
+        
+        # 按日期排序
+        stock_df = stock_df.sort_values('date')
+        
+        # 获取期初和期末价格
+        start_price = float(stock_df.iloc[0]['close'])
+        end_price = float(stock_df.iloc[-1]['close'])
+        trading_days = len(stock_df)
+        
+        # 计算总涨跌幅 = (期末价格 - 期初价格) / 期初价格 * 100
+        total_return = ((end_price - start_price) / start_price) * 100
+        
+        return {
+            'stock_code': stock_code,
+            'start_date': stock_df.iloc[0]['date'].strftime('%Y-%m-%d'),
+            'end_date': stock_df.iloc[-1]['date'].strftime('%Y-%m-%d'),
+            'start_price': round(start_price, 2),
+            'end_price': round(end_price, 2),
+            'total_return': round(total_return, 2),
+            'trading_days': trading_days,
+            'error': None
+        }
+        
+    except Exception as e:
+        return {
+            'stock_code': stock_code,
+            'start_date': start_date,
+            'end_date': end_date,
+            'start_price': None,
+            'end_price': None,
+            'total_return': None,
+            'trading_days': 0,
+            'error': str(e)
+        }
+
+
+def calculate_all_stocks_total_return(start_date: str, end_date: str,
+                                     cache: StockDataCache = None,
+                                     use_cache: bool = True,
+                                     max_stocks: int = None) -> pd.DataFrame:
+    """
+    计算所有北交所股票在指定日期范围内的总涨跌幅度
+    
+    :param start_date: 开始日期 (YYYYMMDD)
+    :param end_date: 结束日期 (YYYYMMDD)
+    :param cache: 缓存管理器
+    :param use_cache: 是否使用缓存
+    :param max_stocks: 最大股票数量，None表示全部
+    :return: DataFrame包含所有股票的总涨跌幅信息
+    """
+    if cache is None:
+        cache = StockDataCache("data")
+    
+    # 获取股票列表
+    stock_info = get_beijing_stocks_data()
+    if stock_info.empty:
+        print("无法获取股票列表")
+        return pd.DataFrame()
+    
+    if '证券代码' in stock_info.columns:
+        stock_codes = stock_info['证券代码'].tolist()
+    elif '代码' in stock_info.columns:
+        stock_codes = stock_info['代码'].tolist()
+    else:
+        print("无法找到股票代码列")
+        return pd.DataFrame()
+    
+    # 创建股票信息映射
+    stock_name_map = {}
+    if '证券代码' in stock_info.columns and '证券简称' in stock_info.columns:
+        for _, row in stock_info.iterrows():
+            stock_name_map[str(row['证券代码'])] = row['证券简称']
+    
+    total_stocks = len(stock_codes)
+    if max_stocks:
+        stock_codes = stock_codes[:max_stocks]
+    process_count = len(stock_codes)
+    
+    print(f"\n{'='*60}")
+    print(f"北交所共有 {total_stocks} 只股票")
+    print(f"将计算前 {process_count} 只股票的总涨跌幅")
+    print(f"时间范围: {start_date} ~ {end_date}")
+    print(f"{'='*60}\n")
+    
+    results = []
+    success_count = 0
+    failed_count = 0
+    
+    for i, code in enumerate(stock_codes):
+        print(f"\r[{i+1}/{process_count}] 正在处理: {code}", end='', flush=True)
+        
+        result = calculate_total_return(str(code), start_date, end_date, cache, use_cache)
+        
+        # 添加股票名称
+        result['stock_name'] = stock_name_map.get(str(code), '')
+        results.append(result)
+        
+        if result['error'] is None:
+            success_count += 1
+            print(f"  ✓ {result['total_return']:>8.2f}%")
+        else:
+            failed_count += 1
+            print(f"  × {result['error']}")
+        
+        # 每处理10只股票后休息
+        if (i + 1) % 10 == 0 and i + 1 < process_count:
+            pause_time = random.uniform(2, 5)
+            print(f"\n  已处理 {i+1} 只，休息 {pause_time:.1f} 秒...")
+            time.sleep(pause_time)
+    
+    print(f"\n\n{'='*60}")
+    print(f"完成！成功: {success_count} 只，失败: {failed_count} 只")
+    print(f"{'='*60}")
+    
+    # 转换为DataFrame
+    df = pd.DataFrame(results)
+    
+    # 按总涨跌幅排序
+    if not df.empty and 'total_return' in df.columns:
+        df = df.sort_values('total_return', ascending=False, na_position='last')
+    
+    return df
+
+
 # ==================== 完整交易数据获取和缓存功能 ====================
 
 def fetch_and_cache_full_stock_data(stock_code: str, start_date: str = None, end_date: str = None,
@@ -958,6 +1150,417 @@ def fetch_all_bj_stocks_full_data(start_date: str = None, end_date: str = None,
     print(f"{'='*60}")
     
     return all_stocks_data
+
+
+# ==================== 综合因子计算与可视化 ====================
+
+def fetch_and_cache_bz50_data(start_date: str, end_date: str,
+                             cache: StockDataCache = None,
+                             use_cache: bool = True) -> pd.DataFrame:
+    """
+    获取并缓存北证50指数数据
+    
+    :param start_date: 开始日期 (YYYYMMDD)
+    :param end_date: 结束日期 (YYYYMMDD)
+    :param cache: 缓存管理器
+    :param use_cache: 是否使用缓存
+    :return: 北证50指数DataFrame
+    """
+    if cache is None:
+        cache = StockDataCache("data")
+    
+    # 北证50指数代码
+    bz50_code = "899050"
+    
+    # 使用fetch_and_cache_full_stock_data获取数据
+    market_df = fetch_and_cache_full_stock_data(
+        bz50_code, start_date, end_date, cache, use_cache
+    )
+    
+    return market_df
+
+
+def calculate_all_factors_and_compare(start_date: str, end_date: str,
+                                     cache: StockDataCache = None,
+                                     use_cache: bool = True,
+                                     max_stocks: int = 20,
+                                     output_file: str = None) -> pd.DataFrame:
+    """
+    综合计算所有因子并与总涨跌幅对比
+    
+    :param start_date: 开始日期 (YYYYMMDD)
+    :param end_date: 结束日期 (YYYYMMDD)
+    :param cache: 缓存管理器
+    :param use_cache: 是否使用缓存
+    :param max_stocks: 最大股票数量
+    :param output_file: 输出CSV文件路径
+    :return: DataFrame包含所有因子和总涨跌幅
+    """
+    if cache is None:
+        cache = StockDataCache("data")
+    
+    # 获取北证50数据
+    print("\n正在获取北证50指数数据...")
+    market_df = fetch_and_cache_bz50_data(start_date, end_date, cache, use_cache)
+    if market_df.empty:
+        print("无法获取北证50数据")
+        return pd.DataFrame()
+    
+    # 获取股票列表
+    stock_info = get_beijing_stocks_data()
+    if stock_info.empty:
+        print("无法获取股票列表")
+        return pd.DataFrame()
+    
+    if '证券代码' in stock_info.columns:
+        stock_codes = stock_info['证券代码'].tolist()
+    elif '代码' in stock_info.columns:
+        stock_codes = stock_info['代码'].tolist()
+    else:
+        print("无法找到股票代码列")
+        return pd.DataFrame()
+    
+    # 创建股票名称映射
+    stock_name_map = {}
+    if '证券代码' in stock_info.columns and '证券简称' in stock_info.columns:
+        for _, row in stock_info.iterrows():
+            stock_name_map[str(row['证券代码'])] = row['证券简称']
+    
+    # 限制股票数量
+    if max_stocks:
+        stock_codes = stock_codes[:max_stocks]
+    
+    print(f"\n{'='*70}")
+    print(f"将计算 {len(stock_codes)} 只股票的综合因子")
+    print(f"时间范围: {start_date} ~ {end_date}")
+    print(f"{'='*70}\n")
+    
+    results = []
+    success_count = 0
+    failed_count = 0
+    
+    for i, code in enumerate(stock_codes):
+        stock_code = str(code)
+        stock_name = stock_name_map.get(stock_code, '')
+        print(f"\r[{i+1}/{len(stock_codes)}] 正在处理: {stock_code} {stock_name}", end='', flush=True)
+        
+        try:
+            # 获取股票完整数据
+            stock_df = fetch_and_cache_full_stock_data(
+                stock_code, start_date, end_date, cache, use_cache
+            )
+            
+            if stock_df.empty:
+                failed_count += 1
+                print(f"  × 无数据")
+                continue
+            
+            # 1. 计算总涨跌幅
+            start_price = float(stock_df.iloc[0]['close'])
+            end_price = float(stock_df.iloc[-1]['close'])
+            total_return = ((end_price - start_price) / start_price) * 100
+            
+            # 2. 计算涨跌幅匹配度因子
+            stock_levels = {}
+            market_levels = {}
+            for _, row in stock_df.iterrows():
+                date = row['date'].strftime('%Y-%m-%d')
+                change_pct = float(row['pct_chg']) if pd.notna(row['pct_chg']) else 0.0
+                stock_levels[date] = calculate_price_change_level(change_pct)
+            
+            for _, row in market_df.iterrows():
+                date = row['date'].strftime('%Y-%m-%d')
+                change_pct = float(row['pct_chg']) if pd.notna(row['pct_chg']) else 0.0
+                market_levels[date] = calculate_price_change_level(change_pct)
+            
+            match_days = 0
+            total_days = 0
+            for date, stock_level in stock_levels.items():
+                if date in market_levels:
+                    total_days += 1
+                    if stock_level == market_levels[date]:
+                        match_days += 1
+            
+            match_ratio = match_days / total_days if total_days > 0 else 0
+            
+            # 3. 计算相关性因子
+            corr_factor = calculate_correlation_factor(stock_df, market_df)
+            
+            # 4. 计算波动性因子
+            vol_factor = calculate_volatility_factor(stock_df, market_df)
+            
+            # 5. 计算成交量因子
+            volume_factor = calculate_volume_factor(stock_df)
+            
+            # 整合结果
+            result = {
+                'stock_code': stock_code,
+                'stock_name': stock_name,
+                'trading_days': len(stock_df),
+                'total_return': round(total_return, 2),
+                # 涨跌幅匹配度因子
+                'match_ratio': round(match_ratio, 4),
+                # 相关性因子
+                'pearson_corr': corr_factor['pearson_corr'],
+                'spearman_corr': corr_factor['spearman_corr'],
+                'beta': corr_factor['beta'],
+                'direction_match_rate': corr_factor['direction_match_rate'],
+                # 波动性因子
+                'stock_volatility': vol_factor['stock_volatility'],
+                'relative_volatility': vol_factor['relative_volatility'],
+                'amplitude_corr': vol_factor['amplitude_corr'],
+                # 成交量因子
+                'avg_volume': volume_factor['avg_volume'],
+                'avg_turnover': volume_factor['avg_turnover']
+            }
+            
+            results.append(result)
+            success_count += 1
+            print(f"  ✓ 总涨跌幅: {total_return:>8.2f}%, 匹配率: {match_ratio:>6.2%}")
+            
+        except Exception as e:
+            failed_count += 1
+            print(f"  × 失败: {e}")
+        
+        # 每处理10只股票后休息
+        if (i + 1) % 10 == 0 and i + 1 < len(stock_codes):
+            pause_time = random.uniform(2, 4)
+            print(f"\n  已处理 {i+1} 只，休息 {pause_time:.1f} 秒...")
+            time.sleep(pause_time)
+    
+    print(f"\n\n{'='*70}")
+    print(f"完成！成功: {success_count} 只，失败: {failed_count} 只")
+    print(f"{'='*70}")
+    
+    # 转换为DataFrame
+    df = pd.DataFrame(results)
+    
+    # 按总涨跌幅排序
+    if not df.empty and 'total_return' in df.columns:
+        df = df.sort_values('total_return', ascending=False, na_position='last')
+    
+    # 保存到文件
+    if output_file and not df.empty:
+        df.to_csv(output_file, index=False, encoding='utf-8-sig')
+        print(f"\n结果已保存到: {output_file}")
+    
+    return df
+
+
+def plot_factors_comparison(df: pd.DataFrame, output_image: str = None, chart_type: str = 'bar'):
+    """
+    绘制因子与总涨跌幅对比图
+    
+    :param df: 包含所有因子的DataFrame
+    :param output_image: 输出图片路径
+    :param chart_type: 图表类型，'bar'为柱状图，'line'为线图
+    """
+    if df.empty:
+        print("数据为空，无法绘图")
+        return
+    
+    # 过滤掉无效数据
+    df = df.dropna(subset=['total_return'])
+    
+    if df.empty:
+        print("没有有效数据，无法绘图")
+        return
+    
+    # 确保中文字体已配置
+    setup_chinese_font()
+    
+    # 准备数据：选择关键因子
+    stock_labels = df['stock_name'].tolist() if 'stock_name' in df.columns else df['stock_code'].tolist()
+    
+    # 创建图表
+    fig, axes = plt.subplots(3, 2, figsize=(16, 14))
+    chart_type_title = '柱状图' if chart_type == 'bar' else '线图'
+    fig.suptitle(f'北交所股票因子与总涨跌幅对比分析（{chart_type_title}）', fontsize=16, fontweight='bold')
+    
+    # 1. 总涨跌幅 vs 涨跌幅匹配率
+    ax1 = axes[0, 0]
+    x_pos = np.arange(len(stock_labels))
+    
+    # 归一化数据到同一范围以便对比
+    total_return_normalized = df['total_return'].values
+    match_ratio_normalized = df['match_ratio'].values * 100  # 转换为百分比
+    
+    if chart_type == 'line':
+        ax1.plot(x_pos, total_return_normalized, marker='o', label='总涨跌幅(%)', color='steelblue', linewidth=2, markersize=6)
+        ax1.plot(x_pos, match_ratio_normalized, marker='s', label='匹配率(%)', color='coral', linewidth=2, markersize=6)
+    else:  # bar
+        width = 0.35
+        ax1.bar(x_pos - width/2, total_return_normalized, width, label='总涨跌幅(%)', color='steelblue')
+        ax1.bar(x_pos + width/2, match_ratio_normalized, width, label='匹配率(%)', color='coral')
+    
+    ax1.set_ylabel('数值(%)')
+    ax1.set_title('总涨跌幅 vs 涨跌幅匹配率')
+    ax1.set_xticks(x_pos)
+    ax1.set_xticklabels(stock_labels, rotation=45, ha='right', fontsize=8)
+    ax1.legend()
+    ax1.grid(axis='y', alpha=0.3)
+    ax1.axhline(y=0, color='black', linestyle='-', linewidth=0.5)
+    
+    # 2. 总涨跌幅 vs Pearson相关系数
+    ax2 = axes[0, 1]
+    pearson_normalized = df['pearson_corr'].values * 100  # 缩放到百分比
+    
+    if chart_type == 'line':
+        ax2.plot(x_pos, total_return_normalized, marker='o', label='总涨跌幅(%)', color='steelblue', linewidth=2, markersize=6)
+        ax2.plot(x_pos, pearson_normalized, marker='s', label='Pearson相关系数×100', color='lightgreen', linewidth=2, markersize=6)
+    else:
+        width = 0.35
+        ax2.bar(x_pos - width/2, total_return_normalized, width, label='总涨跌幅(%)', color='steelblue')
+        ax2.bar(x_pos + width/2, pearson_normalized, width, label='Pearson相关系数×100', color='lightgreen')
+    
+    ax2.set_ylabel('数值')
+    ax2.set_title('总涨跌幅 vs Pearson相关系数')
+    ax2.set_xticks(x_pos)
+    ax2.set_xticklabels(stock_labels, rotation=45, ha='right', fontsize=8)
+    ax2.legend()
+    ax2.grid(axis='y', alpha=0.3)
+    ax2.axhline(y=0, color='black', linestyle='-', linewidth=0.5)
+    
+    # 3. 总涨跌幅 vs Beta系数
+    ax3 = axes[1, 0]
+    beta_normalized = df['beta'].values * 50  # 缩放Beta系数
+    
+    if chart_type == 'line':
+        ax3.plot(x_pos, total_return_normalized, marker='o', label='总涨跌幅(%)', color='steelblue', linewidth=2, markersize=6)
+        ax3.plot(x_pos, beta_normalized, marker='s', label='Beta系数×50', color='gold', linewidth=2, markersize=6)
+    else:
+        width = 0.35
+        ax3.bar(x_pos - width/2, total_return_normalized, width, label='总涨跌幅(%)', color='steelblue')
+        ax3.bar(x_pos + width/2, beta_normalized, width, label='Beta系数×50', color='gold')
+    
+    ax3.set_ylabel('数值')
+    ax3.set_title('总涨跌幅 vs Beta系数')
+    ax3.set_xticks(x_pos)
+    ax3.set_xticklabels(stock_labels, rotation=45, ha='right', fontsize=8)
+    ax3.legend()
+    ax3.grid(axis='y', alpha=0.3)
+    ax3.axhline(y=0, color='black', linestyle='-', linewidth=0.5)
+    
+    # 4. 总涨跌幅 vs 方向一致性
+    ax4 = axes[1, 1]
+    direction_normalized = df['direction_match_rate'].values * 100
+    
+    if chart_type == 'line':
+        ax4.plot(x_pos, total_return_normalized, marker='o', label='总涨跌幅(%)', color='steelblue', linewidth=2, markersize=6)
+        ax4.plot(x_pos, direction_normalized, marker='s', label='方向一致性(%)', color='mediumpurple', linewidth=2, markersize=6)
+    else:
+        width = 0.35
+        ax4.bar(x_pos - width/2, total_return_normalized, width, label='总涨跌幅(%)', color='steelblue')
+        ax4.bar(x_pos + width/2, direction_normalized, width, label='方向一致性(%)', color='mediumpurple')
+    
+    ax4.set_ylabel('数值(%)')
+    ax4.set_title('总涨跌幅 vs 方向一致性')
+    ax4.set_xticks(x_pos)
+    ax4.set_xticklabels(stock_labels, rotation=45, ha='right', fontsize=8)
+    ax4.legend()
+    ax4.grid(axis='y', alpha=0.3)
+    ax4.axhline(y=0, color='black', linestyle='-', linewidth=0.5)
+    
+    # 5. 总涨跌幅 vs 相对波动率
+    ax5 = axes[2, 0]
+    rel_vol_normalized = df['relative_volatility'].values * 50  # 缩放相对波动率
+    
+    if chart_type == 'line':
+        ax5.plot(x_pos, total_return_normalized, marker='o', label='总涨跌幅(%)', color='steelblue', linewidth=2, markersize=6)
+        ax5.plot(x_pos, rel_vol_normalized, marker='s', label='相对波动率×50', color='salmon', linewidth=2, markersize=6)
+    else:
+        width = 0.35
+        ax5.bar(x_pos - width/2, total_return_normalized, width, label='总涨跌幅(%)', color='steelblue')
+        ax5.bar(x_pos + width/2, rel_vol_normalized, width, label='相对波动率×50', color='salmon')
+    
+    ax5.set_ylabel('数值')
+    ax5.set_title('总涨跌幅 vs 相对波动率')
+    ax5.set_xticks(x_pos)
+    ax5.set_xticklabels(stock_labels, rotation=45, ha='right', fontsize=8)
+    ax5.legend()
+    ax5.grid(axis='y', alpha=0.3)
+    ax5.axhline(y=0, color='black', linestyle='-', linewidth=0.5)
+    
+    # 6. 总涨跌幅 vs 平均换手率
+    ax6 = axes[2, 1]
+    # 过滤掉NaN值
+    turnover_data = df['avg_turnover'].fillna(0).values * 10  # 缩放换手率
+    
+    if chart_type == 'line':
+        ax6.plot(x_pos, total_return_normalized, marker='o', label='总涨跌幅(%)', color='steelblue', linewidth=2, markersize=6)
+        ax6.plot(x_pos, turnover_data, marker='s', label='平均换手率×10', color='lightcoral', linewidth=2, markersize=6)
+    else:
+        width = 0.35
+        ax6.bar(x_pos - width/2, total_return_normalized, width, label='总涨跌幅(%)', color='steelblue')
+        ax6.bar(x_pos + width/2, turnover_data, width, label='平均换手率×10', color='lightcoral')
+    
+    ax6.set_ylabel('数值')
+    ax6.set_title('总涨跌幅 vs 平均换手率')
+    ax6.set_xticks(x_pos)
+    ax6.set_xticklabels(stock_labels, rotation=45, ha='right', fontsize=8)
+    ax6.legend()
+    ax6.grid(axis='y', alpha=0.3)
+    ax6.axhline(y=0, color='black', linestyle='-', linewidth=0.5)
+    
+    plt.tight_layout()
+    
+    # 保存图片
+    if output_image:
+        plt.savefig(output_image, dpi=300, bbox_inches='tight')
+        print(f"\n图表已保存到: {output_image}")
+    
+    plt.show()
+
+
+def analyze_factors_and_visualize(start_date: str = '20240101', end_date: str = '20241231',
+                                 max_stocks: int = 20,
+                                 use_cache: bool = True,
+                                 chart_type: str = 'bar'):
+    """
+    综合分析：计算所有因子并生成可视化对比图
+    
+    :param start_date: 开始日期 (YYYYMMDD)
+    :param end_date: 结束日期 (YYYYMMDD)
+    :param max_stocks: 最大股票数量
+    :param use_cache: 是否使用缓存
+    :param chart_type: 图表类型，'bar'为柱状图，'line'为线图
+    """
+    # 生成输出文件名
+    timestamp = datetime.now().strftime('%Y%m%d_%H%M%S')
+    csv_file = f'factors_comparison_{timestamp}.csv'
+    image_file = f'factors_comparison_{chart_type}_{timestamp}.png'
+    
+    # 计算所有因子
+    print("="*70)
+    print("开始综合因子分析...")
+    print("="*70)
+    
+    df = calculate_all_factors_and_compare(
+        start_date=start_date,
+        end_date=end_date,
+        max_stocks=max_stocks,
+        use_cache=use_cache,
+        output_file=csv_file
+    )
+    
+    if not df.empty:
+        # 显示统计摘要
+        print("\n" + "="*70)
+        print("统计摘要")
+        print("="*70)
+        print(f"平均总涨跌幅: {df['total_return'].mean():.2f}%")
+        print(f"平均匹配率: {df['match_ratio'].mean():.2%}")
+        print(f"平均Pearson相关系数: {df['pearson_corr'].mean():.4f}")
+        print(f"平均Beta系数: {df['beta'].mean():.4f}")
+        print(f"平均方向一致性: {df['direction_match_rate'].mean():.2%}")
+        print(f"平均相对波动率: {df['relative_volatility'].mean():.4f}")
+        
+        # 生成可视化图表
+        chart_type_name = '柱状图' if chart_type == 'bar' else '线图'
+        print(f"\n生成可视化图表（{chart_type_name}）...")
+        plot_factors_comparison(df, output_image=image_file, chart_type=chart_type)
+    else:
+        print("\n没有数据可供分析")
 
 
 if __name__ == "__main__":
