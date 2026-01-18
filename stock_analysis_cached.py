@@ -213,41 +213,6 @@ def get_beijing_stock_daily(symbol: str, start_date: str, end_date: str, retry_c
                 return pd.DataFrame()
 
 
-def get_bz50_index_daily(start_date: str, end_date: str, retry_count: int = 3):
-    """
-    获取北证50指数日线数据（带重试机制）
-    :param retry_count: 重试次数
-    """
-    for attempt in range(retry_count):
-        try:
-            # 动态sleep时间
-            sleep_time = random.uniform(0.5, 2.0)
-            time.sleep(sleep_time)
-            
-            # 北证50指数代码是899050，直接使用stock_zh_a_hist接口
-            bz50_df = ak.stock_zh_a_hist(
-                symbol="899050",
-                period="daily",
-                start_date=start_date,
-                end_date=end_date,
-                adjust="hfq"
-            )
-            
-            if not bz50_df.empty and '日期' in bz50_df.columns:
-                # 重命名列以便后续处理
-                bz50_df = bz50_df.rename(columns={'日期': 'date', '涨跌幅': 'pct_chg'})
-                bz50_df['date'] = pd.to_datetime(bz50_df['date'])
-            
-            return bz50_df
-        except Exception as e:
-            if attempt < retry_count - 1:
-                wait_time = (attempt + 1) * 2
-                print(f"获取北证50指数数据失败，{wait_time}秒后重试... (第{attempt+1}/{retry_count}次)")
-                time.sleep(wait_time)
-            else:
-                print(f"获取北证50指数数据失败: {e}")
-                return pd.DataFrame()
-
 
 def calculate_price_change_level(change_percent: float) -> int:
     """
@@ -265,163 +230,27 @@ def calculate_price_change_level(change_percent: float) -> int:
         return 1  # 大跌
 
 
-def fetch_and_cache_stock_data(stock_code: str, start_date: str, end_date: str,
-                               cache: StockDataCache, use_cache: bool = True) -> Dict[str, float]:
-    """
-    获取并缓存股票数据（支持增量更新）
-    :return: {日期: 涨跌幅百分比}
-    """
-    if use_cache:
-        # 检查缓存中的日期范围
-        cached_start, cached_end = cache.get_cached_date_range(stock_code)
-        # 检查股票实际存在的日期范围（用于判断股票是否已上市）
-        actual_start, actual_end = cache.get_stock_actual_date_range(stock_code)
-        
-        # 如果已知道股票的实际上市日期，检查请求范围是否在股票上市之前
-        if actual_start:
-            # 只检查开始日期，不检查结束日期（允许查询未来数据）
-            actual_start_num = actual_start.replace('-', '')
-            start_date_num = start_date.replace('-', '')
-            
-            # 如果请求的开始日期在股票上市之前，调整到上市日
-            if start_date_num < actual_start_num:
-                start_date = actual_start.replace('-', '')
-                print(f"  股票 {stock_code} 在{start_date_num}之前未上市，调整开始日期为{actual_start}")
-        
-        # 计算需要下载的日期范围
-        missing_ranges = calculate_missing_date_ranges(cached_start, cached_end, start_date, end_date)
-        
-        if not missing_ranges:
-            print(f"  股票 {stock_code} 使用缓存数据")
-            cached_data = cache.load_stock_data(stock_code)
-            # 过滤出指定日期范围的数据
-            result = {}
-            for date, change in cached_data['daily_data'].items():
-                if start_date <= date.replace('-', '') <= end_date:
-                    result[date] = change
-            return result
-        else:
-            print(f"  股票 {stock_code} 需要下载缺失数据段: {missing_ranges}")
-    else:
-        missing_ranges = [(start_date, end_date)]
-    
-    # 下载缺失的数据
-    all_data = {}
-    for range_start, range_end in missing_ranges:
-        try:
-            stock_df = get_beijing_stock_daily(str(stock_code), range_start, range_end)
-            if not stock_df.empty:
-                stock_df['日期'] = pd.to_datetime(stock_df['日期'])
-                for _, row in stock_df.iterrows():
-                    date = row['日期'].strftime('%Y-%m-%d')
-                    change_pct = float(row['涨跌幅']) if '涨跌幅' in row else 0.0
-                    all_data[date] = change_pct
-            else:
-                # 如果下载失败且不知道实际范围，记录为空范围
-                if not cache.get_stock_actual_date_range(stock_code)[0]:
-                    # 这支股票可能还未上市或已退市
-                    cache.metadata[stock_code] = {
-                        'actual_start_date': None,
-                        'actual_end_date': None,
-                        'last_update': datetime.now().strftime('%Y-%m-%d %H:%M:%S')
-                    }
-                    cache._save_metadata()
-        except Exception as e:
-            print(f"  下载股票 {stock_code} 数据失败: {e}")
-    
-    # 合并到缓存数据
-    if use_cache:
-        merged_data = cache.merge_stock_data(stock_code, all_data)
-        cache.save_stock_data(stock_code, {'daily_data': merged_data})
-        
-        # 返回指定日期范围的数据
-        result = {}
-        for date, change in merged_data.items():
-            if start_date <= date.replace('-', '') <= end_date:
-                result[date] = change
-        return result
-    
-    return all_data
-
-
-def get_bz50_market_levels_cached(start_date: str, end_date: str,
-                                  cache: StockDataCache, use_cache: bool = True) -> Dict[str, int]:
-    """
-    获取北证50指数每日涨跌等级（带缓存）
-    """
-    market_code = "899050"  # 北证50指数代码
-    
-    if use_cache:
-        # 检查缓存
-        market_data = cache.load_market_data()
-        if market_data and 'daily_changes' in market_data:
-            cached_changes = market_data['daily_changes']
-            # 检查缓存是否包含需要的日期范围
-            cached_dates = set(cached_changes.keys())
-            
-            # 过滤出需要的日期范围并转换为等级
-            result = {}
-            for date, change_pct in cached_changes.items():
-                date_num = date.replace('-', '')
-                if start_date <= date_num <= end_date:
-                    level = calculate_price_change_level(change_pct)
-                    result[date] = level
-            
-            # 如果缓存完全覆盖需求范围，直接返回
-            if result:
-                # 检查是否需要下载更多数据
-                if cached_dates:
-                    cached_start = min(cached_dates).replace('-', '')
-                    cached_end = max(cached_dates).replace('-', '')
-                    if start_date >= cached_start and end_date <= cached_end:
-                        print(f"北证50指数使用缓存数据")
-                        return result
-    
-    # 需要下载新数据
-    print(f"正在下载北证50指数数据...")
-    try:
-        bz50_df = get_bz50_index_daily(start_date, end_date)
-        
-        bz50_changes = {}  # 存储实际涨跌幅
-        bz50_levels = {}   # 存储涨跌等级
-        
-        if not bz50_df.empty:
-            for _, row in bz50_df.iterrows():
-                date = row['date'].strftime('%Y-%m-%d')
-                change_pct = float(row['pct_chg']) if 'pct_chg' in row else 0.0
-                bz50_changes[date] = change_pct  # 保存实际涨跌幅
-                level = calculate_price_change_level(change_pct)
-                bz50_levels[date] = level
-        
-        # 合并到缓存（缓存实际涨跌幅，而非等级）
-        if use_cache:
-            existing_data = cache.load_market_data()
-            if existing_data and 'daily_changes' in existing_data:
-                existing_data['daily_changes'].update(bz50_changes)
-                cache.save_market_data(existing_data)
-            else:
-                cache.save_market_data({'daily_changes': bz50_changes})
-        
-        # 返回涨跌等级（用于相似度计算）
-        result = {}
-        for date, level in bz50_levels.items():
-            date_num = date.replace('-', '')
-            if start_date <= date_num <= end_date:
-                result[date] = level
-        
-        return result
-        
-    except Exception as e:
-        print(f"获取北证50指数失败: {e}")
-        return {}
+# 注：fetch_and_cache_stock_data 和 get_bz50_market_levels_cached 已被移除
+# 现在统一使用 fetch_and_cache_full_stock_data 获取完整数据
 
 
 def calculate_individual_stocks_levels_cached(start_date: str, end_date: str,
-                                              cache: StockDataCache, use_cache: bool = True,
+                                              cache: StockDataCache = None, use_cache: bool = True,
                                               max_stocks: int = 10) -> Dict[str, Dict[str, int]]:
     """
     计算北交所每只股票每日涨跌幅度等级（带缓存）
+    使用 fetch_and_cache_full_stock_data 获取完整数据，提取涨跌幅并转换为等级
+    
+    :param start_date: 开始日期 (YYYYMMDD)
+    :param end_date: 结束日期 (YYYYMMDD)
+    :param cache: 缓存管理器
+    :param use_cache: 是否使用缓存
+    :param max_stocks: 最大股票数量
+    :return: {stock_code: {date: level}}
     """
+    if cache is None:
+        cache = StockDataCache("data")
+    
     stock_info = get_beijing_stocks_data()
     if stock_info.empty:
         print("无法获取股票列表，返回空数据")
@@ -447,11 +276,17 @@ def calculate_individual_stocks_levels_cached(start_date: str, end_date: str,
         print(f"\r正在获取个股数据 - 第 {i+1}/{process_stocks} 只股票: {code}", end='', flush=True)
         
         try:
-            stock_data = fetch_and_cache_stock_data(str(code), start_date, end_date, cache, use_cache)
+            # 使用 fetch_and_cache_full_stock_data 获取完整数据
+            stock_df = fetch_and_cache_full_stock_data(
+                str(code), start_date, end_date, cache, use_cache
+            )
             
-            if stock_data:
+            if not stock_df.empty:
                 stock_levels = {}
-                for date, change_pct in stock_data.items():
+                # 从DataFrame中提取涨跌幅并转换为等级
+                for _, row in stock_df.iterrows():
+                    date = row['date'].strftime('%Y-%m-%d')
+                    change_pct = float(row['pct_chg']) if pd.notna(row['pct_chg']) else 0.0
                     level = calculate_price_change_level(change_pct)
                     stock_levels[date] = level
                 
@@ -517,6 +352,7 @@ def calculate_single_stock_similarity(stock_code: str, start_date: str, end_date
                                      cache: StockDataCache = None, use_cache: bool = True) -> Dict:
     """
     计算单支股票与北证50指数的匹配度
+    使用 fetch_and_cache_full_stock_data 获取完整数据
     
     :param stock_code: 股票代码 (例: "920000")
     :param start_date: 开始日期 (格式: YYYYMMDD)
@@ -540,8 +376,8 @@ def calculate_single_stock_similarity(stock_code: str, start_date: str, end_date
     
     # 1. 获取北证50指数数据
     print(f"正在获取北证50指数数据...")
-    market_levels = get_bz50_market_levels_cached(start_date, end_date, cache, use_cache)
-    if not market_levels:
+    market_df = fetch_and_cache_full_stock_data("899050", start_date, end_date, cache, use_cache)
+    if market_df.empty:
         return {
             "error": "无法获取北证50指数数据",
             "stock_code": stock_code,
@@ -550,12 +386,20 @@ def calculate_single_stock_similarity(stock_code: str, start_date: str, end_date
             "match_ratio": 0.0,
             "details": []
         }
-    print(f"✓ 获取到 {len(market_levels)} 天的北证50数据")
+    print(f"✓ 获取到 {len(market_df)} 天的北证50数据")
+    
+    # 将北证50数据转换为 {date: level} 字典
+    market_levels = {}
+    for _, row in market_df.iterrows():
+        date = row['date'].strftime('%Y-%m-%d')
+        change_pct = float(row['pct_chg']) if pd.notna(row['pct_chg']) else 0.0
+        level = calculate_price_change_level(change_pct)
+        market_levels[date] = level
     
     # 2. 获取个股数据
     print(f"\n正在获取股票 {stock_code} 的数据...")
-    stock_data = fetch_and_cache_stock_data(stock_code, start_date, end_date, cache, use_cache)
-    if not stock_data:
+    stock_df = fetch_and_cache_full_stock_data(stock_code, start_date, end_date, cache, use_cache)
+    if stock_df.empty:
         return {
             "error": f"无法获取股票 {stock_code} 数据",
             "stock_code": stock_code,
@@ -564,7 +408,7 @@ def calculate_single_stock_similarity(stock_code: str, start_date: str, end_date
             "match_ratio": 0.0,
             "details": []
         }
-    print(f"✓ 获取到 {len(stock_data)} 天的股票数据")
+    print(f"✓ 获取到 {len(stock_df)} 天的股票数据")
     
     # 3. 计算每日的等级和匹配度
     print(f"\n正在计算匹配度...")
@@ -572,26 +416,26 @@ def calculate_single_stock_similarity(stock_code: str, start_date: str, end_date
     total_days = 0
     details = []
     
-    # 获取所有共同日期并排序
-    common_dates = sorted(set(stock_data.keys()) & set(market_levels.keys()))
-    
-    for date in common_dates:
-        stock_change_pct = stock_data[date]
-        stock_level = calculate_price_change_level(stock_change_pct)
-        market_level = market_levels[date]
-        
-        is_matched = (stock_level == market_level)
-        total_days += 1
-        if is_matched:
-            match_days += 1
-        
-        details.append({
-            "date": date,
-            "stock_change_pct": round(stock_change_pct, 2),
-            "stock_level": stock_level,
-            "market_level": market_level,
-            "matched": is_matched
-        })
+    # 遍历个股数据，与市场数据匹配
+    for _, row in stock_df.iterrows():
+        date = row['date'].strftime('%Y-%m-%d')
+        if date in market_levels:
+            stock_change_pct = float(row['pct_chg']) if pd.notna(row['pct_chg']) else 0.0
+            stock_level = calculate_price_change_level(stock_change_pct)
+            market_level = market_levels[date]
+            
+            is_matched = (stock_level == market_level)
+            total_days += 1
+            if is_matched:
+                match_days += 1
+            
+            details.append({
+                "date": date,
+                "stock_change_pct": round(stock_change_pct, 2),
+                "stock_level": stock_level,
+                "market_level": market_level,
+                "matched": is_matched
+            })
     
     # 4. 计算匹配率
     match_ratio = match_days / total_days if total_days > 0 else 0.0
@@ -633,12 +477,23 @@ def main():
     
     # 获取北交所大盘每日涨跌等级
     print("正在获取北证50指数数据...")
-    market_levels = get_bz50_market_levels_cached(
+    market_df = fetch_and_cache_full_stock_data(
+        "899050",
         config['start_date'],
         config['end_date'],
         cache,
         config['cache_enabled']
     )
+    
+    # 将DataFrame转换为等级字典
+    market_levels = {}
+    if not market_df.empty:
+        for _, row in market_df.iterrows():
+            date = row['date'].strftime('%Y-%m-%d')
+            change_pct = float(row['pct_chg']) if pd.notna(row['pct_chg']) else 0.0
+            level = calculate_price_change_level(change_pct)
+            market_levels[date] = level
+    
     print(f"获取到 {len(market_levels)} 天的北证50数据")
     if market_levels:
         sample_dates = sorted(market_levels.keys())[:5]
@@ -1106,13 +961,13 @@ def fetch_all_bj_stocks_full_data(start_date: str = None, end_date: str = None,
 
 
 if __name__ == "__main__":
-    # main()
+    main()
     # 测试获取完整历史数据（不指定日期，自动使用上市日期到今天）
-    fetch_all_bj_stocks_full_data(
-        max_stocks=3,
-        use_cache=True,
-        end_date="20260116",
-    )
+    # fetch_all_bj_stocks_full_data(
+    #     max_stocks=3,
+    #     use_cache=True,
+    #     end_date="20260116",
+    # )
     
     # 或者指定日期范围获取部分数据
     # fetch_all_bj_stocks_full_data(
