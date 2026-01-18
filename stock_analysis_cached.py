@@ -12,6 +12,8 @@ import json
 import os
 from datetime import datetime, timedelta
 import random
+import numpy as np
+from scipy import stats
 warnings.filterwarnings('ignore')
 
 
@@ -676,6 +678,143 @@ def main():
     else:
         print("没有可排序的数据")
 
+
+
+# ==================== 多因子计算功能 ====================
+
+def calculate_correlation_factor(stock_df: pd.DataFrame, market_df: pd.DataFrame) -> dict:
+    """
+    计算相关性因子
+    
+    :param stock_df: 个股完整数据
+    :param market_df: 市场(北证50)完整数据
+    :return: 相关性因子字典，包含：
+        - pearson_corr: Pearson相关系数
+        - pearson_pvalue: Pearson相关系数的p值
+        - spearman_corr: Spearman秩相关系数
+        - spearman_pvalue: Spearman相关系数的p值
+        - beta: Beta系数
+        - direction_match_rate: 方向一致性（涨跌方向匹配率）
+    """
+    # 合并数据，只保留共同日期
+    merged = pd.merge(
+        stock_df[['date', 'pct_chg']],
+        market_df[['date', 'pct_chg']],
+        on='date',
+        suffixes=('_stock', '_market')
+    )
+    
+    if len(merged) < 5:  # 至少需要5个数据点
+        return {
+            'pearson_corr': np.nan,
+            'pearson_pvalue': np.nan,
+            'spearman_corr': np.nan,
+            'spearman_pvalue': np.nan,
+            'beta': np.nan,
+            'direction_match_rate': np.nan
+        }
+    
+    stock_returns = merged['pct_chg_stock'].values
+    market_returns = merged['pct_chg_market'].values
+    
+    # Pearson相关系数 (使用scipy计算，包含p值)
+    pearson_corr, pearson_pvalue = stats.pearsonr(stock_returns, market_returns)
+    
+    # Spearman秩相关系数 (适用于非线性关系)
+    spearman_corr, spearman_pvalue = stats.spearmanr(stock_returns, market_returns)
+    
+    # Beta系数 = Cov(stock, market) / Var(market)
+    cov_matrix = np.cov(stock_returns, market_returns)
+    beta = cov_matrix[0, 1] / cov_matrix[1, 1] if cov_matrix[1, 1] != 0 else np.nan
+    
+    # 方向一致性（同涨同跌）
+    same_direction = ((stock_returns > 0) == (market_returns > 0)).sum()
+    direction_match_rate = same_direction / len(merged)
+    
+    return {
+        'pearson_corr': round(pearson_corr, 4),
+        'pearson_pvalue': round(pearson_pvalue, 4),
+        'spearman_corr': round(spearman_corr, 4),
+        'spearman_pvalue': round(spearman_pvalue, 4),
+        'beta': round(beta, 4),
+        'direction_match_rate': round(direction_match_rate, 4)
+    }
+
+
+def calculate_volatility_factor(stock_df: pd.DataFrame, market_df: pd.DataFrame) -> dict:
+    """
+    计算波动性因子
+    
+    :param stock_df: 个股完整数据
+    :param market_df: 市场(北证50)完整数据
+    :return: 波动性因子字典，包含：
+        - stock_volatility: 个股波动率（涨跌幅标准差）
+        - market_volatility: 市场波动率（涨跌幅标准差）
+        - relative_volatility: 相对波动率（个股/市场）
+        - volatility_diff: 波动率差值
+        - amplitude_corr: 振幅相关性
+        - amplitude_pvalue: 振幅相关性的p值
+    """
+    stock_volatility = stock_df['pct_chg'].std()
+    market_volatility = market_df['pct_chg'].std()
+    
+    relative_volatility = stock_volatility / market_volatility if market_volatility != 0 else np.nan
+    volatility_diff = abs(stock_volatility - market_volatility)
+    
+    # 计算振幅相关性
+    if 'amplitude' in stock_df.columns and 'amplitude' in market_df.columns:
+        merged = pd.merge(stock_df[['date', 'amplitude']], 
+                         market_df[['date', 'amplitude']], 
+                         on='date', suffixes=('_stock', '_market'))
+        if len(merged) >= 5:
+            # 使用scipy计算相关系数
+            amplitude_corr, amplitude_pvalue = stats.pearsonr(
+                merged['amplitude_stock'].values,
+                merged['amplitude_market'].values
+            )
+        else:
+            amplitude_corr = np.nan
+            amplitude_pvalue = np.nan
+    else:
+        amplitude_corr = np.nan
+        amplitude_pvalue = np.nan
+    
+    return {
+        'stock_volatility': round(stock_volatility, 4),
+        'market_volatility': round(market_volatility, 4),
+        'relative_volatility': round(relative_volatility, 4),
+        'volatility_diff': round(volatility_diff, 4),
+        'amplitude_corr': round(amplitude_corr, 4) if not np.isnan(amplitude_corr) else np.nan,
+        'amplitude_pvalue': round(amplitude_pvalue, 4) if not np.isnan(amplitude_pvalue) else np.nan
+    }
+
+
+def calculate_volume_factor(stock_df: pd.DataFrame) -> dict:
+    """
+    计算成交量因子
+    
+    :param stock_df: 个股完整数据
+    :return: 成交量因子字典，包含：
+        - avg_volume: 平均成交量
+        - volume_std: 成交量标准差
+        - avg_turnover: 平均换手率
+    """
+    if 'volume' not in stock_df.columns or stock_df['volume'].isna().all():
+        return {
+            'avg_volume': np.nan,
+            'volume_std': np.nan,
+            'avg_turnover': np.nan
+        }
+    
+    avg_volume = stock_df['volume'].mean()
+    volume_std = stock_df['volume'].std()
+    avg_turnover = stock_df['turnover'].mean() if 'turnover' in stock_df.columns else np.nan
+    
+    return {
+        'avg_volume': round(avg_volume, 2),
+        'volume_std': round(volume_std, 2),
+        'avg_turnover': round(avg_turnover, 4) if not np.isnan(avg_turnover) else np.nan
+    }
 
 
 # ==================== 完整交易数据获取和缓存功能 ====================
