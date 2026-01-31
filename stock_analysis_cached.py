@@ -53,16 +53,30 @@ class AntiCrawlerManager:
     智能反爬虫管理器（针对akshare优化）
     
     注意：akshare内部有自己的请求机制，我们无法直接控制其User-Agent和Session。
-    因此本管理器聚焦于：
+    但在下载PDF等直接HTTP请求时，可以使用完整的反爬虫策略。
+    
+    功能：
     1. 动态请求间隔（防止请求过快）
     2. 失败重试指数退避（给服务器缓冲时间）
     3. 智能批次暂停（根据失败率调整）
     4. 请求频率限制（模拟人类行为）
+    5. User-Agent轮换（用于PDF下载等直接请求）
+    6. Session管理（用于PDF下载等直接请求）
     
     这些策略在实际测试中可以将失败率从30-50%降低到10-20%。
     """
     
     def __init__(self):
+        # User-Agent池（用于PDF下载等直接HTTP请求）
+        self.user_agents = [
+            'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
+            'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/119.0.0.0 Safari/537.36',
+            'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
+            'Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:121.0) Gecko/20100101 Firefox/121.0',
+            'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.1 Safari/605.1.15',
+            'Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36'
+        ]
+        
         # 请求间隔配置（秒）
         self.min_interval = 1.5  # 最小间隔
         self.max_interval = 4.0  # 最大间隔
@@ -75,6 +89,24 @@ class AntiCrawlerManager:
         
         # 最后请求时间
         self.last_request_time = 0
+    
+    def get_headers(self):
+        """获取随机请求头（用于PDF下载等直接HTTP请求）"""
+        return {
+            'User-Agent': random.choice(self.user_agents),
+            'Accept': 'application/pdf,application/x-pdf,*/*',
+            'Accept-Language': 'zh-CN,zh;q=0.9,en;q=0.8',
+            'Accept-Encoding': 'gzip, deflate',
+            'Connection': 'keep-alive',
+            'Referer': 'http://www.cninfo.com.cn/',
+        }
+    
+    def get_session(self):
+        """获取HTTP Session（用于PDF下载等直接请求）"""
+        import requests
+        session = requests.Session()
+        session.headers.update(self.get_headers())
+        return session
     
     def wait_before_request(self):
         """请求前等待（防止请求过快）"""
@@ -2381,28 +2413,73 @@ def get_stock_announcements(stock_code: str, exchange: Exchange, start_date: str
     if cache is None:
         cache = StockDataCache("data", exchange)
     
-    # 缓存文件路径
+    # 缓存文件路径（不包含时间范围）
     announcements_dir = os.path.join(cache.data_dir, "announcements", cache.exchange_name)
     os.makedirs(announcements_dir, exist_ok=True)
-    cache_file = os.path.join(announcements_dir, f"{stock_code}_{start_date}_{end_date}.json")
+    cache_file = os.path.join(announcements_dir, f"{stock_code}.json")
     
-    # 检查缓存
+    # 转换日期格式为 datetime 以便比较
+    request_start = pd.to_datetime(start_date, format='%Y%m%d')
+    request_end = pd.to_datetime(end_date, format='%Y%m%d')
+    
+    # 读取现有缓存
+    cached_announcements = []
+    time_ranges = []  # 已缓存的时间范围
+    
     if use_cache and os.path.exists(cache_file):
         try:
             with open(cache_file, 'r', encoding='utf-8') as f:
                 cache_data = json.load(f)
-            df = pd.DataFrame(cache_data['data'])
-            if '公告时间' in df.columns:
-                df['公告时间'] = pd.to_datetime(df['公告时间'])
-            print(f"  [缓存] 从缓存读取公告数据: {len(df)}条")
-            return df
+            
+            # 读取已缓存的公告
+            if 'data' in cache_data and cache_data['data']:
+                df_cached = pd.DataFrame(cache_data['data'])
+                if '公告时间' in df_cached.columns:
+                    df_cached['公告时间'] = pd.to_datetime(df_cached['公告时间'])
+                    cached_announcements = df_cached.to_dict('records')
+            
+            # 读取已缓存的时间范围
+            if 'time_ranges' in cache_data:
+                time_ranges = cache_data['time_ranges']
+            
+            print(f"  [缓存] 读取现有缓存: {len(cached_announcements)}条公告, {len(time_ranges)}个时间范围")
         except Exception as e:
             print(f"  [警告] 缓存读取失败: {e}，将重新获取")
+            cached_announcements = []
+            time_ranges = []
+    
+    # 检查请求的时间范围是否已完全缓存
+    def is_range_covered(req_start, req_end, ranges):
+        """检查请求范围是否被已缓存范围完全覆盖"""
+        if not ranges:
+            return False
+        
+        for r in ranges:
+            r_start = pd.to_datetime(r['start_date'], format='%Y%m%d')
+            r_end = pd.to_datetime(r['end_date'], format='%Y%m%d')
+            if r_start <= req_start and r_end >= req_end:
+                return True
+        return False
+    
+    # 如果请求范围已完全缓存，直接返回过滤后的结果
+    if is_range_covered(request_start, request_end, time_ranges):
+        df = pd.DataFrame(cached_announcements)
+        if not df.empty and '公告时间' in df.columns:
+            # 过滤到请求的时间范围
+            mask = (df['公告时间'] >= request_start) & (df['公告时间'] <= request_end)
+            df = df[mask].copy()
+            print(f"  [缓存命中] 从缓存过滤到 {len(df)} 条公告")
+            return df
+        return pd.DataFrame()
+    
+    # 需要从服务器获取新数据
+    print(f"  [获取] 请求范围 {start_date}~{end_date} 未完全缓存，将从服务器获取")
     
     # 获取反爬虫管理器
     acm = get_anti_crawler_manager()
     
     # 尝试获取公告
+    new_df = pd.DataFrame()
     for attempt in range(retry_count):
         try:
             # 使用反爬虫管理器的等待机制
@@ -2411,7 +2488,7 @@ def get_stock_announcements(stock_code: str, exchange: Exchange, start_date: str
             
             # akshare接口：stock_zh_a_disclosure_report_cninfo
             # 该接口支持沪深京A股
-            df = ak.stock_zh_a_disclosure_report_cninfo(
+            new_df = ak.stock_zh_a_disclosure_report_cninfo(
                 symbol=stock_code,
                 start_date=start_date,
                 end_date=end_date
@@ -2419,22 +2496,8 @@ def get_stock_announcements(stock_code: str, exchange: Exchange, start_date: str
             
             # 成功后调整间隔
             acm.adjust_interval_on_success()
-            
-            # 保存到缓存
-            if use_cache and not df.empty:
-                cache_data = {
-                    'stock_code': stock_code,
-                    'exchange': exchange.value,
-                    'start_date': start_date,
-                    'end_date': end_date,
-                    'last_update': datetime.now().strftime('%Y-%m-%d %H:%M:%S'),
-                    'total_count': len(df),
-                    'data': df.to_dict('records')
-                }
-                with open(cache_file, 'w', encoding='utf-8') as f:
-                    json.dump(cache_data, f, ensure_ascii=False, indent=2)
-            
-            return df
+            print(f"  [成功] 获取到 {len(new_df)} 条新公告")
+            break
             
         except Exception as e:
             # 调整失败间隔
@@ -2447,7 +2510,107 @@ def get_stock_announcements(stock_code: str, exchange: Exchange, start_date: str
                 time.sleep(wait_time)
             else:
                 print(f"  获取公告 {stock_code} ({exchange.value}) 失败: {e}")
+                # 失败时返回缓存中的数据（如果有）
+                if cached_announcements:
+                    df = pd.DataFrame(cached_announcements)
+                    if '公告时间' in df.columns:
+                        mask = (df['公告时间'] >= request_start) & (df['公告时间'] <= request_end)
+                        df = df[mask].copy()
+                        print(f"  [降级] 返回缓存中的 {len(df)} 条公告")
+                        return df
                 return pd.DataFrame()
+    
+    # 合并新旧数据
+    if not new_df.empty:
+        # 确保时间列是 datetime 类型
+        if '公告时间' in new_df.columns:
+            new_df['公告时间'] = pd.to_datetime(new_df['公告时间'])
+    
+    # 合并缓存和新数据
+    all_announcements = cached_announcements.copy()
+    if not new_df.empty:
+        # 添加新公告（去重）
+        new_records = new_df.to_dict('records')
+        
+        # 使用公告链接作为唯一标识，去除重复
+        existing_links = {r.get('公告链接') for r in all_announcements if '公告链接' in r}
+        for record in new_records:
+            if record.get('公告链接') not in existing_links:
+                all_announcements.append(record)
+                existing_links.add(record.get('公告链接'))
+    
+    # 按公告时间降序排列（最新到最旧）
+    if all_announcements:
+        df_all = pd.DataFrame(all_announcements)
+        if '公告时间' in df_all.columns:
+            df_all['公告时间'] = pd.to_datetime(df_all['公告时间'])
+            df_all = df_all.sort_values('公告时间', ascending=False)
+            all_announcements = df_all.to_dict('records')
+    
+    # 更新时间范围记录
+    def merge_time_ranges(ranges, new_start, new_end):
+        """合并时间范围，避免重复和碎片化"""
+        ranges = ranges.copy()
+        ranges.append({'start_date': new_start, 'end_date': new_end})
+        
+        # 转换为datetime并排序
+        ranges_dt = []
+        for r in ranges:
+            ranges_dt.append({
+                'start': pd.to_datetime(r['start_date'], format='%Y%m%d'),
+                'end': pd.to_datetime(r['end_date'], format='%Y%m%d'),
+                'start_str': r['start_date'],
+                'end_str': r['end_date']
+            })
+        ranges_dt.sort(key=lambda x: x['start'])
+        
+        # 合并重叠的范围
+        merged = []
+        for r in ranges_dt:
+            if not merged:
+                merged.append(r)
+            else:
+                last = merged[-1]
+                # 如果当前范围与最后一个范围重叠或相邻，合并
+                if r['start'] <= last['end'] + pd.Timedelta(days=1):
+                    last['end'] = max(last['end'], r['end'])
+                    last['end_str'] = last['end'].strftime('%Y%m%d')
+                else:
+                    merged.append(r)
+        
+        # 转换回字符串格式
+        return [{'start_date': r['start_str'], 'end_date': r['end_str']} for r in merged]
+    
+    time_ranges = merge_time_ranges(time_ranges, start_date, end_date)
+    
+    # 保存到缓存
+    if use_cache:
+        cache_data = {
+            'stock_code': stock_code,
+            'exchange': exchange.value,
+            'time_ranges': time_ranges,
+            'last_update': datetime.now().strftime('%Y-%m-%d %H:%M:%S'),
+            'total_count': len(all_announcements),
+            'data': all_announcements
+        }
+        
+        try:
+            with open(cache_file, 'w', encoding='utf-8') as f:
+                json.dump(cache_data, f, ensure_ascii=False, indent=2, default=str)
+            print(f"  [缓存] 已更新缓存: {len(all_announcements)}条公告, {len(time_ranges)}个时间范围")
+        except Exception as e:
+            print(f"  [警告] 缓存保存失败: {e}")
+    
+    # 返回请求时间范围内的数据
+    if all_announcements:
+        df_result = pd.DataFrame(all_announcements)
+        if '公告时间' in df_result.columns:
+            df_result['公告时间'] = pd.to_datetime(df_result['公告时间'])
+            mask = (df_result['公告时间'] >= request_start) & (df_result['公告时间'] <= request_end)
+            df_result = df_result[mask].copy()
+            return df_result
+    
+    return pd.DataFrame()
 
 
 def get_multiple_stocks_announcements(stock_codes: List[str], exchange: Exchange, 
@@ -2590,6 +2753,292 @@ def analyze_stock_announcements_by_exchange(exchange: Exchange, start_date: str,
         print(df.head(10).to_string(index=False))
     
     return df
+
+
+# ==================== 公告PDF下载功能 ====================
+
+def download_announcement_pdf(announcement_id: str, announcement_time: str, 
+                             stock_code: str = None, stock_name: str = None,
+                             save_dir: str = "data/pdfs", 
+                             retry_count: int = 3) -> str:
+    """
+    下载单个公告PDF文件
+    
+    :param announcement_id: 公告ID
+    :param announcement_time: 公告时间 (YYYY-MM-DD)
+    :param stock_code: 股票代码（可选，用于文件命名）
+    :param stock_name: 股票简称（可选，用于文件命名）
+    :param save_dir: 保存目录
+    :param retry_count: 重试次数
+    :return: 保存的文件路径，失败返回None
+    """
+    import requests
+    
+    # 创建保存目录
+    os.makedirs(save_dir, exist_ok=True)
+    
+    # 构造PDF下载链接
+    # 格式: http://static.cninfo.com.cn/finalpage/<announcementTime>/<announcementId>.PDF
+    # announcementTime格式: YYYY-MM-DD
+    pdf_url = f"http://static.cninfo.com.cn/finalpage/{announcement_time}/{announcement_id}.PDF"
+    
+    # 构造文件名
+    if stock_code and stock_name:
+        filename = f"{stock_code}_{stock_name}_{announcement_time}_{announcement_id}.pdf"
+    elif stock_code:
+        filename = f"{stock_code}_{announcement_time}_{announcement_id}.pdf"
+    else:
+        filename = f"{announcement_time}_{announcement_id}.pdf"
+    
+    # 安全化文件名（移除非法字符）
+    filename = filename.replace('/', '_').replace('\\', '_').replace(':', '_')
+    save_path = os.path.join(save_dir, filename)
+    
+    # 如果文件已存在，直接返回
+    if os.path.exists(save_path):
+        print(f"  [缓存] PDF已存在: {filename}")
+        return save_path
+    
+    # 获取反爬虫管理器
+    acm = get_anti_crawler_manager()
+    
+    # 尝试下载
+    for attempt in range(retry_count):
+        try:
+            # 使用反爬虫管理器的等待机制
+            acm.wait_before_request()
+            acm.total_requests += 1
+            
+            # 使用随机User-Agent和Headers
+            headers = acm.get_headers()
+            
+            # 发起请求
+            response = requests.get(pdf_url, headers=headers, timeout=30, stream=True)
+            response.raise_for_status()
+            
+            # 检查是否为PDF文件
+            content_type = response.headers.get('Content-Type', '')
+            if 'pdf' not in content_type.lower():
+                print(f"  [警告] 返回的不是PDF文件: {content_type}")
+                acm.adjust_interval_on_failure()
+                if attempt < retry_count - 1:
+                    wait_time = acm.get_retry_wait_time(attempt)
+                    print(f"  {wait_time:.1f}秒后重试... (第{attempt+1}/{retry_count}次)")
+                    time.sleep(wait_time)
+                    continue
+                else:
+                    return None
+            
+            # 保存PDF文件
+            with open(save_path, 'wb') as f:
+                for chunk in response.iter_content(chunk_size=8192):
+                    if chunk:
+                        f.write(chunk)
+            
+            # 成功后调整间隔
+            acm.adjust_interval_on_success()
+            
+            file_size = os.path.getsize(save_path) / 1024  # KB
+            print(f"  ✓ 下载成功: {filename} ({file_size:.1f} KB)")
+            return save_path
+            
+        except requests.exceptions.RequestException as e:
+            # 调整失败间隔
+            acm.adjust_interval_on_failure()
+            
+            if attempt < retry_count - 1:
+                wait_time = acm.get_retry_wait_time(attempt)
+                print(f"  下载PDF失败，{wait_time:.1f}秒后重试... (第{attempt+1}/{retry_count}次)")
+                print(f"  错误: {str(e)[:100]}")
+                time.sleep(wait_time)
+            else:
+                print(f"  × 下载PDF失败: {e}")
+                return None
+        except Exception as e:
+            print(f"  × 未知错误: {e}")
+            return None
+
+
+def download_announcements_pdfs(announcements_df: pd.DataFrame, 
+                               save_dir: str = "data/pdfs",
+                               max_pdfs: int = None,
+                               title_keywords: List[str] = None,
+                               title_exclude_keywords: List[str] = None) -> Dict[str, str]:
+    """
+    批量下载公告PDF文件
+    
+    :param announcements_df: 公告DataFrame（必须包含列：公告时间、公告链接）
+    :param save_dir: 保存目录
+    :param max_pdfs: 最大下载数量
+    :param title_keywords: 标题必须包含的关键词列表（任意一个匹配即可），例如：['增持', '减持']
+    :param title_exclude_keywords: 标题必须不包含的关键词列表（任意一个匹配则排除），例如：['更正', '补充']
+    :return: 字典 {announcement_id: file_path}
+    """
+    if announcements_df.empty:
+        print("公告数据为空，无法下载")
+        return {}
+    
+    # 验证必要的列
+    required_columns = ['公告时间', '公告链接']
+    for col in required_columns:
+        if col not in announcements_df.columns:
+            print(f"缺少必要的列: {col}")
+            return {}
+    
+    # 过滤标题
+    df_filtered = announcements_df.copy()
+    original_count = len(df_filtered)
+    
+    if title_keywords:
+        # 标题必须包含任意一个关键词
+        if '公告标题' in df_filtered.columns:
+            mask = df_filtered['公告标题'].str.contains('|'.join(title_keywords), case=False, na=False)
+            df_filtered = df_filtered[mask]
+            print(f"\n[过滤] 标题包含关键词 {title_keywords}: {len(df_filtered)}/{original_count} 条")
+        else:
+            print("警告: 公告数据中没有'公告标题'列，无法按关键词过滤")
+    
+    if title_exclude_keywords:
+        # 标题必须不包含任意一个排除关键词
+        if '公告标题' in df_filtered.columns:
+            exclude_mask = df_filtered['公告标题'].str.contains('|'.join(title_exclude_keywords), case=False, na=False)
+            df_filtered = df_filtered[~exclude_mask]
+            print(f"[过滤] 排除标题包含 {title_exclude_keywords}: {len(df_filtered)}/{original_count} 条")
+    
+    if df_filtered.empty:
+        print("过滤后没有符合条件的公告")
+        return {}
+    
+    acm = get_anti_crawler_manager()
+    downloaded_files = {}
+    success_count = 0
+    failed_count = 0
+    
+    # 限制下载数量
+    df_to_process = df_filtered.head(max_pdfs) if max_pdfs else df_filtered
+    total = len(df_to_process)
+    
+    print(f"\n开始下载 {total} 个PDF文件...")
+    
+    for i, row in df_to_process.iterrows():
+        idx = success_count + failed_count + 1
+        
+        # 提取announcement_id和announcement_time
+        pdf_link = row['公告链接']
+        announcement_time_str = str(row['公告时间'])
+        
+        # 从链接中提取announcement_id
+        # 链接格式: http://www.cninfo.com.cn/new/disclosure/detail?...&announcementId=1222355536&...
+        import re
+        match = re.search(r'announcementId=(\d+)', pdf_link)
+        if not match:
+            print(f"\n[{idx}/{total}] × 无法从链接中提取announcement_id: {pdf_link}")
+            failed_count += 1
+            continue
+        
+        announcement_id = match.group(1)
+        
+        # 处理announcement_time格式
+        # 可能是 datetime 或 字符串
+        if isinstance(row['公告时间'], pd.Timestamp):
+            announcement_time = row['公告时间'].strftime('%Y-%m-%d')
+        else:
+            # 已经是字符串，直接使用
+            announcement_time = str(row['公告时间']).split()[0]  # 取日期部分
+        
+        # 获取股票信息
+        stock_code = row.get('代码', None)
+        stock_name = row.get('简称', None)
+        title = row.get('公告标题', '')[:50]  # 截取前50个字符
+        
+        print(f"\n[{idx}/{total}] {stock_code} - {title}")
+        
+        # 下载PDF
+        file_path = download_announcement_pdf(
+            announcement_id=announcement_id,
+            announcement_time=announcement_time,
+            stock_code=stock_code,
+            stock_name=stock_name,
+            save_dir=save_dir
+        )
+        
+        if file_path:
+            downloaded_files[announcement_id] = file_path
+            success_count += 1
+        else:
+            failed_count += 1
+        
+        # 使用智能批次暂停机制
+        if acm.should_pause_batch():
+            pause_time = acm.get_batch_pause_time()
+            failure_rate = acm.failed_requests / max(acm.total_requests, 1)
+            print(f"\n  [智能暂停] 已处理 {idx} 个PDF，失败率{failure_rate:.1%}，休息 {pause_time:.1f} 秒后继续...")
+            time.sleep(pause_time)
+    
+    # 总结
+    print(f"\n===== PDF下载总结 =====")
+    print(f"成功: {success_count} 个")
+    print(f"失败: {failed_count} 个")
+    print(f"请求统计: 总请求 {acm.total_requests} 次，失败 {acm.failed_requests} 次，失败率 {acm.failed_requests/max(acm.total_requests, 1):.1%}")
+    print(f"PDF文件保存在: {save_dir}")
+    
+    return downloaded_files
+
+
+def download_stock_announcements_with_pdfs(stock_code: str, exchange: Exchange,
+                                          start_date: str, end_date: str,
+                                          download_pdfs: bool = True,
+                                          max_pdfs: int = None,
+                                          save_dir: str = None,
+                                          title_keywords: List[str] = None,
+                                          title_exclude_keywords: List[str] = None) -> tuple:
+    """
+    获取股票公告并下载PDF（一条龙服务）
+    
+    :param stock_code: 股票代码
+    :param exchange: 交易所
+    :param start_date: 开始日期
+    :param end_date: 结束日期
+    :param download_pdfs: 是否下载PDF
+    :param max_pdfs: 最大下载数量
+    :param save_dir: PDF保存目录
+    :param title_keywords: 标题必须包含的关键词列表（任意一个匹配即可）
+    :param title_exclude_keywords: 标题必须不包含的关键词列表（任意一个匹配则排除）
+    :return: (announcements_df, downloaded_files_dict)
+    """
+    # 获取公告列表
+    print(f"\n步骤1: 获取 {stock_code} 的公告列表...")
+    announcements_df = get_stock_announcements(
+        stock_code=stock_code,
+        exchange=exchange,
+        start_date=start_date,
+        end_date=end_date,
+        use_cache=True
+    )
+    
+    if announcements_df.empty:
+        print("没有找到公告")
+        return announcements_df, {}
+    
+    print(f"找到 {len(announcements_df)} 条公告")
+    
+    # 下载PDF
+    downloaded_files = {}
+    if download_pdfs:
+        print(f"\n步骤2: 下载PDF文件...")
+        
+        if save_dir is None:
+            save_dir = f"data/pdfs/{exchange.value}/{stock_code}"
+        
+        downloaded_files = download_announcements_pdfs(
+            announcements_df=announcements_df,
+            save_dir=save_dir,
+            max_pdfs=max_pdfs,
+            title_keywords=title_keywords,
+            title_exclude_keywords=title_exclude_keywords
+        )
+    
+    return announcements_df, downloaded_files
 
 
 if __name__ == "__main__":
