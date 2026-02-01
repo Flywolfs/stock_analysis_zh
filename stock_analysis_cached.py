@@ -4,6 +4,7 @@
 """
 
 import akshare as ak
+import tushare as ts
 import pandas as pd
 from typing import Dict, List, Tuple, Optional
 import warnings
@@ -44,6 +45,15 @@ def setup_chinese_font():
 
 # 初始化中文字体配置
 setup_chinese_font()
+
+# 初始化tushare token
+try:
+    ts.set_token('46666172d473a128a0a60182301616dfc1eee0c3623693407a5f30aa')
+    _ts_pro = ts.pro_api()
+    print("Tushare初始化成功")
+except Exception as e:
+    print(f"Tushare初始化失败: {e}")
+    _ts_pro = None
 
 
 # ==================== 增强反爬虫机制 ====================
@@ -430,7 +440,7 @@ def get_beijing_stock_daily(symbol: str, start_date: str, end_date: str, retry_c
     :param retry_count: 重试次数
     :return: 日线数据DataFrame
     """
-    return get_stock_daily(symbol, Exchange.BSE, start_date, end_date, retry_count)
+    return get_stock_daily_tushare(symbol, Exchange.BSE, start_date, end_date, retry_count)
 
 
 def get_stock_daily(symbol: str, exchange: Exchange, start_date: str, end_date: str, retry_count: int = 3):
@@ -491,6 +501,123 @@ def get_stock_daily(symbol: str, exchange: Exchange, start_date: str, end_date: 
                 time.sleep(wait_time)
             else:
                 print(f"获取股票 {symbol} ({exchange.value}) 数据失败: {e}")
+                traceback.print_exc()
+                return pd.DataFrame()
+
+
+def get_stock_daily_tushare(symbol: str, exchange: Exchange, start_date: str, end_date: str, retry_count: int = 3):
+    """
+    使用tushare获取单个股票的日线数据（带重试机制，支持多交易所）
+    
+    :param symbol: 股票代码 (不带后缀，如 "600000", "000001", "920000")
+    :param exchange: 交易所枚举
+    :param start_date: 开始日期 格式: YYYYMMDD
+    :param end_date: 结束日期 格式: YYYYMMDD
+    :param retry_count: 重试次数
+    :return: 日线数据DataFrame
+    """
+    if _ts_pro is None:
+        print("错误: Tushare未正确初始化")
+        return pd.DataFrame()
+    
+    # 根据交易所添加后缀
+    if exchange == Exchange.SSE:
+        ts_code = f"{symbol}.SH"  # 上海交易所
+    elif exchange == Exchange.SZSE:
+        ts_code = f"{symbol}.SZ"  # 深圳交易所
+    elif exchange == Exchange.BSE:
+        ts_code = f"{symbol}.BJ"  # 北京交易所
+    else:
+        print(f"不支持的交易所: {exchange}")
+        return pd.DataFrame()
+    
+    acm = get_anti_crawler_manager()
+    
+    for attempt in range(retry_count):
+        try:
+            # 使用反爬虫管理器的等待机制
+            acm.wait_before_request()
+            acm.total_requests += 1
+            
+            # 使用tushare的pro_bar接口
+            # 注意：tushare的日期格式是 YYYYMMDD，并且start_date和end_date顺序相反
+            stock_df = ts.pro_bar(
+                ts_code=ts_code,
+                adj='qfq',  # 后复权
+                start_date=start_date,
+                end_date=end_date,
+                asset='E'  # E表示股票
+            )
+            
+            if stock_df is None or stock_df.empty:
+                print(f"警告: 股票 {ts_code} 没有数据")
+                acm.adjust_interval_on_failure()
+                if attempt < retry_count - 1:
+                    wait_time = acm.get_retry_wait_time(attempt)
+                    time.sleep(wait_time)
+                    continue
+                return pd.DataFrame()
+            
+            # 转换列名以匹配akshare格式
+            # tushare返回的列名：trade_date, open, high, low, close, vol, amount
+            # akshare返回的列名：日期, 开盘, 收盘, 最高, 最低, 成交量, 成交额, 振幅, 涨跌幅, 涨跌额, 换手率
+            
+            # 重命名列
+            column_mapping = {
+                'trade_date': '日期',
+                'open': '开盘',
+                'high': '最高',
+                'low': '最低',
+                'close': '收盘',
+                'vol': '成交量',
+                'amount': '成交额',
+                'pct_chg': '涨跌幅',
+                'change': '涨跌额',
+                'pre_close': '昨收',
+                'turnover_rate': '换手率'
+            }
+            
+            # 选择需要的列并重命名
+            available_columns = {k: v for k, v in column_mapping.items() if k in stock_df.columns}
+            stock_df = stock_df.rename(columns=available_columns)
+            
+            # 计算振幅（如果tushare没有这个字段）
+            if '振幅' not in stock_df.columns:
+                if '最高' in stock_df.columns and '最低' in stock_df.columns and '昨收' in stock_df.columns:
+                    stock_df['振幅'] = ((stock_df['最高'] - stock_df['最低']) / stock_df['昨收'] * 100).round(2)
+            
+            # tushare的成交量单位是手，需要转换为股（*100）
+            if '成交量' in stock_df.columns:
+                stock_df['成交量'] = (stock_df['成交量'] * 100).astype(int)
+            
+            # tushare的成交额单位是千元，需要转换为元（*1000）
+            if '成交额' in stock_df.columns:
+                stock_df['成交额'] = (stock_df['成交额'] * 1000).round(2)
+            
+            # 转换日期格式
+            if '日期' in stock_df.columns:
+                stock_df['日期'] = pd.to_datetime(stock_df['日期'], format='%Y%m%d')
+            
+            # 按日期升序排列（tushare默认是降序）
+            stock_df = stock_df.sort_values('日期').reset_index(drop=True)
+            
+            # 成功后调整间隔
+            acm.adjust_interval_on_success()
+            print(f"✓ Tushare成功获取 {ts_code} 数据: {len(stock_df)} 条")
+            return stock_df
+            
+        except Exception as e:
+            # 调整失败间隔
+            acm.adjust_interval_on_failure()
+            
+            if attempt < retry_count - 1:
+                # 使用指数退避等待时间
+                wait_time = acm.get_retry_wait_time(attempt)
+                print(f"获取股票 {ts_code} ({exchange.value}) 数据失败，{wait_time:.1f}秒后重试... (第{attempt+1}/{retry_count}次)")
+                print(f"  错误信息: {str(e)[:100]}")
+                time.sleep(wait_time)
+            else:
+                print(f"Tushare获取股票 {ts_code} ({exchange.value}) 数据失败: {e}")
                 traceback.print_exc()
                 return pd.DataFrame()
 
